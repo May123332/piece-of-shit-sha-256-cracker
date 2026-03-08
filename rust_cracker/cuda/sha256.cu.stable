@@ -1,0 +1,200 @@
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdint.h>
+#include <stdio.h>
+
+// PTX Optimized Rotates (funnel shift)
+#define ROR(x, n) (__funnelshift_r((x), (x), (n)))
+
+// Optimized Logic
+#define CH(x, y, z) (z ^ (x & (y ^ z)))
+#define MAJ(x, y, z) ((x & y) | (z & (x | y)))
+
+#define SIGMA0(x) (ROR(x, 2) ^ ROR(x, 13) ^ ROR(x, 22))
+#define SIGMA1(x) (ROR(x, 6) ^ ROR(x, 11) ^ ROR(x, 25))
+#define GAMMA0(x) (ROR(x, 7) ^ ROR(x, 18) ^ (x >> 3))
+#define GAMMA1(x) (ROR(x, 17) ^ ROR(x, 19) ^ (x >> 10))
+
+#define SWAP(x) (__byte_perm((x), 0, 0x0123))
+
+extern "C" __global__ void brute_force_cuda(
+    const uint8_t* charset, 
+    uint64_t charset_len, 
+    uint64_t start_offset, 
+    uint32_t len,
+    const uint32_t* target_hash, 
+    uint32_t* result_found, 
+    uint8_t* result_word
+) {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (*result_found > 0) return;
+
+    // --- GENERATION PHASE ---
+    uint8_t pass[64];
+    uint64_t temp = start_offset + idx;
+    
+    #pragma unroll
+    for(int i = len - 1; i >= 0; i--) {
+        pass[i] = charset[temp % charset_len];
+        temp /= charset_len;
+    }
+
+    // --- PACKING ---
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15;
+    
+    // Zero init
+    w0=0; w1=0; w2=0; w3=0; w4=0; w5=0; w6=0; w7=0;
+    w8=0; w9=0; w10=0; w11=0; w12=0; w13=0; w14=0; w15=0;
+
+    // Pack bytes (Manual for register optimization)
+    #pragma unroll
+    for(int i=0; i<len; i++) {
+        int wd = i/4;
+        uint8_t val = pass[i];
+        if(wd==0) ((uint8_t*)&w0)[i%4] = val;
+        else if(wd==1) ((uint8_t*)&w1)[i%4] = val;
+        else if(wd==2) ((uint8_t*)&w2)[i%4] = val;
+        else if(wd==3) ((uint8_t*)&w3)[i%4] = val;
+    }
+    
+    // Padding
+    int wd = len/4;
+    int bd = len%4;
+    if(wd==0) ((uint8_t*)&w0)[bd] = 0x80;
+    else if(wd==1) ((uint8_t*)&w1)[bd] = 0x80;
+    else if(wd==2) ((uint8_t*)&w2)[bd] = 0x80;
+    else if(wd==3) ((uint8_t*)&w3)[bd] = 0x80;
+    
+    // Length
+    w15 = __byte_perm((uint32_t)(len*8), 0, 0x0123);
+    
+    w0=SWAP(w0); w1=SWAP(w1); w2=SWAP(w2); w3=SWAP(w3);
+    w4=SWAP(w4); w5=SWAP(w5); w6=SWAP(w6); w7=SWAP(w7);
+    w8=SWAP(w8); w9=SWAP(w9); w10=SWAP(w10); w11=SWAP(w11);
+    w12=SWAP(w12); w13=SWAP(w13); w14=SWAP(w14); // w15 is already BE
+
+    // --- HASHING (Fully Unrolled) ---
+    uint32_t a=0x6a09e667, b=0xbb67ae85, c=0x3c6ef372, d=0xa54ff53a;
+    uint32_t e=0x510e527f, f=0x9b05688c, g=0x1f83d9ab, h=0x5be0cd19;
+    uint32_t t1, t2;
+
+    // K Constants baked into immediates by compiler
+    
+    #define ROUND(i, a, b, c, d, e, f, g, h, k, w) \
+        t1 = h + SIGMA1(e) + CH(e, f, g) + k + w; \
+        t2 = SIGMA0(a) + MAJ(a, b, c); \
+        d += t1; \
+        h = t1 + t2;
+
+    // Rounds 0-15 (Direct W access)
+    ROUND(0, a,b,c,d,e,f,g,h, 0x428a2f98, w0);
+    ROUND(1, h,a,b,c,d,e,f,g, 0x71374491, w1);
+    ROUND(2, g,h,a,b,c,d,e,f, 0xb5c0fbcf, w2);
+    ROUND(3, f,g,h,a,b,c,d,e, 0xe9b5dba5, w3);
+    ROUND(4, e,f,g,h,a,b,c,d, 0x3956c25b, w4);
+    ROUND(5, d,e,f,g,h,a,b,c, 0x59f111f1, w5);
+    ROUND(6, c,d,e,f,g,h,a,b, 0x923f82a4, w6);
+    ROUND(7, b,c,d,e,f,g,h,a, 0xab1c5ed5, w7);
+    ROUND(8, a,b,c,d,e,f,g,h, 0xd807aa98, w8);
+    ROUND(9, h,a,b,c,d,e,f,g, 0x12835b01, w9);
+    ROUND(10, g,h,a,b,c,d,e,f, 0x243185be, w10);
+    ROUND(11, f,g,h,a,b,c,d,e, 0x550c7dc3, w11);
+    ROUND(12, e,f,g,h,a,b,c,d, 0x72be5d74, w12);
+    ROUND(13, d,e,f,g,h,a,b,c, 0x80deb1fe, w13);
+    ROUND(14, c,d,e,f,g,h,a,b, 0x9bdc06a7, w14);
+    ROUND(15, b,c,d,e,f,g,h,a, 0xc19bf174, w15);
+
+    // Rounds 16-63 (Schedule Calculation)
+    #define SCHED(w_target, w_m2, w_m7, w_m15, w_m16) \
+        w_target += GAMMA1(w_m2) + w_m7 + GAMMA0(w_m15);
+
+    // Round 16: Uses w0 (as w16), depends on w14, w9, w1, w0
+    // w0 is now w16
+    SCHED(w0, w14, w9, w1, w0); ROUND(16, a,b,c,d,e,f,g,h, 0xe49b69c1, w0);
+    SCHED(w1, w15, w10, w2, w1); ROUND(17, h,a,b,c,d,e,f,g, 0xefbe4786, w1);
+    SCHED(w2, w0, w11, w3, w2); ROUND(18, g,h,a,b,c,d,e,f, 0x0fc19dc6, w2);
+    SCHED(w3, w1, w12, w4, w3); ROUND(19, f,g,h,a,b,c,d,e, 0x240ca1cc, w3);
+    SCHED(w4, w2, w13, w5, w4); ROUND(20, e,f,g,h,a,b,c,d, 0x2de92c6f, w4);
+    SCHED(w5, w3, w14, w6, w5); ROUND(21, d,e,f,g,h,a,b,c, 0x4a7484aa, w5);
+    SCHED(w6, w4, w15, w7, w6); ROUND(22, c,d,e,f,g,h,a,b, 0x5cb0a9dc, w6);
+    SCHED(w7, w5, w0, w8, w7); ROUND(23, b,c,d,e,f,g,h,a, 0x76f988da, w7);
+    SCHED(w8, w6, w1, w9, w8); ROUND(24, a,b,c,d,e,f,g,h, 0x983e5152, w8);
+    SCHED(w9, w7, w2, w10, w9); ROUND(25, h,a,b,c,d,e,f,g, 0xa831c66d, w9);
+    SCHED(w10, w8, w3, w11, w10); ROUND(26, g,h,a,b,c,d,e,f, 0xb00327c8, w10);
+    SCHED(w11, w9, w4, w12, w11); ROUND(27, f,g,h,a,b,c,d,e, 0xbf597fc7, w11);
+    SCHED(w12, w10, w5, w13, w12); ROUND(28, e,f,g,h,a,b,c,d, 0xc6e00bf3, w12);
+    SCHED(w13, w11, w6, w14, w13); ROUND(29, d,e,f,g,h,a,b,c, 0xd5a79147, w13);
+    SCHED(w14, w12, w7, w15, w14); ROUND(30, c,d,e,f,g,h,a,b, 0x06ca6351, w14);
+    SCHED(w15, w13, w8, w0, w15); ROUND(31, b,c,d,e,f,g,h,a, 0x14292967, w15);
+
+    // 32-47
+    SCHED(w0, w14, w9, w1, w0); ROUND(32, a,b,c,d,e,f,g,h, 0x27b70a85, w0);
+    SCHED(w1, w15, w10, w2, w1); ROUND(33, h,a,b,c,d,e,f,g, 0x2e1b2138, w1);
+    SCHED(w2, w0, w11, w3, w2); ROUND(34, g,h,a,b,c,d,e,f, 0x4d2c6dfc, w2);
+    SCHED(w3, w1, w12, w4, w3); ROUND(35, f,g,h,a,b,c,d,e, 0x53380d13, w3);
+    SCHED(w4, w2, w13, w5, w4); ROUND(36, e,f,g,h,a,b,c,d, 0x650a7354, w4);
+    SCHED(w5, w3, w14, w6, w5); ROUND(37, d,e,f,g,h,a,b,c, 0x766a0abb, w5);
+    SCHED(w6, w4, w15, w7, w6); ROUND(38, c,d,e,f,g,h,a,b, 0x81c2c92e, w6);
+    SCHED(w7, w5, w0, w8, w7); ROUND(39, b,c,d,e,f,g,h,a, 0x92722c85, w7);
+    SCHED(w8, w6, w1, w9, w8); ROUND(40, a,b,c,d,e,f,g,h, 0xa2bfe8a1, w8);
+    SCHED(w9, w7, w2, w10, w9); ROUND(41, h,a,b,c,d,e,f,g, 0xa81a664b, w9);
+    SCHED(w10, w8, w3, w11, w10); ROUND(42, g,h,a,b,c,d,e,f, 0xc24b8b70, w10);
+    SCHED(w11, w9, w4, w12, w11); ROUND(43, f,g,h,a,b,c,d,e, 0xc76c51a3, w11);
+    SCHED(w12, w10, w5, w13, w12); ROUND(44, e,f,g,h,a,b,c,d, 0xd192e819, w12);
+    SCHED(w13, w11, w6, w14, w13); ROUND(45, d,e,f,g,h,a,b,c, 0xd6990624, w13);
+    SCHED(w14, w12, w7, w15, w14); ROUND(46, c,d,e,f,g,h,a,b, 0xf40e3585, w14);
+    SCHED(w15, w13, w8, w0, w15); ROUND(47, b,c,d,e,f,g,h,a, 0x106aa070, w15);
+
+    // 48-63
+    SCHED(w0, w14, w9, w1, w0); ROUND(48, a,b,c,d,e,f,g,h, 0x19a4c116, w0);
+    SCHED(w1, w15, w10, w2, w1); ROUND(49, h,a,b,c,d,e,f,g, 0x1e376c08, w1);
+    SCHED(w2, w0, w11, w3, w2); ROUND(50, g,h,a,b,c,d,e,f, 0x2748774c, w2);
+    SCHED(w3, w1, w12, w4, w3); ROUND(51, f,g,h,a,b,c,d,e, 0x34b0bcb5, w3);
+    SCHED(w4, w2, w13, w5, w4); ROUND(52, e,f,g,h,a,b,c,d, 0x391c0cb3, w4);
+    SCHED(w5, w3, w14, w6, w5); ROUND(53, d,e,f,g,h,a,b,c, 0x4ed8aa4a, w5);
+    SCHED(w6, w4, w15, w7, w6); ROUND(54, c,d,e,f,g,h,a,b, 0x5b9cca4f, w6);
+    SCHED(w7, w5, w0, w8, w7); ROUND(55, b,c,d,e,f,g,h,a, 0x682e6ff3, w7);
+    SCHED(w8, w6, w1, w9, w8); ROUND(56, a,b,c,d,e,f,g,h, 0x748f82ee, w8);
+    SCHED(w9, w7, w2, w10, w9); ROUND(57, h,a,b,c,d,e,f,g, 0x78a5636f, w9);
+    SCHED(w10, w8, w3, w11, w10); ROUND(58, g,h,a,b,c,d,e,f, 0x84c87814, w10);
+    SCHED(w11, w9, w4, w12, w11); ROUND(59, f,g,h,a,b,c,d,e, 0x8cc70208, w11);
+    SCHED(w12, w10, w5, w13, w12); ROUND(60, e,f,g,h,a,b,c,d, 0x90befffa, w12);
+    SCHED(w13, w11, w6, w14, w13); ROUND(61, d,e,f,g,h,a,b,c, 0xa4506ceb, w13);
+    SCHED(w14, w12, w7, w15, w14); ROUND(62, c,d,e,f,g,h,a,b, 0xbef9a3f7, w14);
+    SCHED(w15, w13, w8, w0, w15); ROUND(63, b,c,d,e,f,g,h,a, 0xc67178f2, w15);
+
+    // Check
+    a += 0x6a09e667; b += 0xbb67ae85; c += 0x3c6ef372; d += 0xa54ff53a;
+    e += 0x510e527f; f += 0x9b05688c; g += 0x1f83d9ab; h += 0x5be0cd19;
+
+    bool match = (a==target_hash[0] && b==target_hash[1] && c==target_hash[2] && d==target_hash[3] &&
+                  e==target_hash[4] && f==target_hash[5] && g==target_hash[6] && h==target_hash[7]);
+    
+    if (match) {
+        if (atomicExch(result_found, 1) == 0) {
+            for(int i=0; i<len; i++) result_word[i] = pass[i];
+            result_word[len] = 0;
+        }
+    }
+}
+
+extern "C" void launch_brute_force_cuda(
+    const uint8_t* charset, 
+    uint64_t charset_len, 
+    uint64_t start_offset, 
+    uint32_t len,
+    const uint32_t* target_hash, 
+    uint32_t* result_found, 
+    uint8_t* result_word,
+    uint64_t batch_size,
+    int blocks,
+    int threads
+) {
+    brute_force_cuda<<<blocks, threads>>>(charset, charset_len, start_offset, len, target_hash, result_found, result_word);
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) printf("[CUDA ERROR] Launch: %s\n", cudaGetErrorString(err));
+    
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) printf("[CUDA ERROR] Sync: %s\n", cudaGetErrorString(err));
+}

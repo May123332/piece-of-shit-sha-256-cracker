@@ -1,0 +1,22 @@
+[package]
+name = "rust_cracker"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+sha2 = "0.10"
+md5 = "0.7"
+sha-1 = "0.10"
+hex = "0.4"
+rayon = "1.8"
+anyhow = "1.0"
+itertools = "0.12"
+ocl = "0.19"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = 'abort'
+strip = true

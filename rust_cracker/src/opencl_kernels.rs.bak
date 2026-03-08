@@ -1,0 +1,312 @@
+pub const SHA256_KERNEL: &str = r#"
+// ==========================================
+// SHA-256 CONSTANTS & MACROS (Optimized)
+// ==========================================
+#define K0 0x428a2f98
+#define K1 0x71374491
+#define K2 0xb5c0fbcf
+#define K3 0xe9b5dba5
+#define K4 0x3956c25b
+#define K5 0x59f111f1
+#define K6 0x923f82a4
+#define K7 0xab1c5ed5
+#define K8 0xd807aa98
+#define K9 0x12835b01
+#define K10 0x243185be
+#define K11 0x550c7dc3
+#define K12 0x72be5d74
+#define K13 0x80deb1fe
+#define K14 0x9bdc06a7
+#define K15 0xc19bf174
+#define K16 0xe49b69c1
+#define K17 0xefbe4786
+#define K18 0x0fc19dc6
+#define K19 0x240ca1cc
+#define K20 0x2de92c6f
+#define K21 0x4a7484aa
+#define K22 0x5cb0a9dc
+#define K23 0x76f988da
+#define K24 0x983e5152
+#define K25 0xa831c66d
+#define K26 0xb00327c8
+#define K27 0xbf597fc7
+#define K28 0xc6e00bf3
+#define K29 0xd5a79147
+#define K30 0x06ca6351
+#define K31 0x14292967
+#define K32 0x27b70a85
+#define K33 0x2e1b2138
+#define K34 0x4d2c6dfc
+#define K35 0x53380d13
+#define K36 0x650a7354
+#define K37 0x766a0abb
+#define K38 0x81c2c92e
+#define K39 0x92722c85
+#define K40 0xa2bfe8a1
+#define K41 0xa81a664b
+#define K42 0xc24b8b70
+#define K43 0xc76c51a3
+#define K44 0xd192e819
+#define K45 0xd6990624
+#define K46 0xf40e3585
+#define K47 0x106aa070
+#define K48 0x19a4c116
+#define K49 0x1e376c08
+#define K50 0x2748774c
+#define K51 0x34b0bcb5
+#define K52 0x391c0cb3
+#define K53 0x4ed8aa4a
+#define K54 0x5b9cca4f
+#define K55 0x682e6ff3
+#define K56 0x748f82ee
+#define K57 0x78a5636f
+#define K58 0x84c87814
+#define K59 0x8cc70208
+#define K60 0x90befffa
+#define K61 0xa4506ceb
+#define K62 0xbef9a3f7
+#define K63 0xc67178f2
+
+#define ROR(x, n) ((x >> n) | (x << (32 - n)))
+#define CH(x, y, z) ((x & y) ^ (~x & z))
+#define MAJ(x, y, z) ((x & y) ^ (x & z) ^ (y & z))
+#define SIGMA0(x) (ROR(x, 2) ^ ROR(x, 13) ^ ROR(x, 22))
+#define SIGMA1(x) (ROR(x, 6) ^ ROR(x, 11) ^ ROR(x, 25))
+#define GAMMA0(x) (ROR(x, 7) ^ ROR(x, 18) ^ (x >> 3))
+#define GAMMA1(x) (ROR(x, 17) ^ ROR(x, 19) ^ (x >> 10))
+
+// Helper to perform SHA256 transform on a 64-byte block
+// We inline this to allow the compiler to unroll loops inside the main function
+void sha256_transform_block(uint* state, const uchar* block) {
+    uint W[64];
+    uint a, b, c, d, e, f, g, h;
+    uint t1, t2;
+
+    // Load Message Schedule (Unrolled first 16)
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        W[i] = (block[i * 4] << 24) | (block[i * 4 + 1] << 16) | (block[i * 4 + 2] << 8) | block[i * 4 + 3];
+    }
+    
+    // Expansion
+    #pragma unroll
+    for (int i = 16; i < 64; i++) {
+        W[i] = GAMMA1(W[i - 2]) + W[i - 7] + GAMMA0(W[i - 15]) + W[i - 16];
+    }
+
+    a = state[0]; b = state[1]; c = state[2]; d = state[3];
+    e = state[4]; f = state[5]; g = state[6]; h = state[7];
+
+    uint K[] = {
+        K0, K1, K2, K3, K4, K5, K6, K7, K8, K9, K10, K11, K12, K13, K14, K15,
+        K16, K17, K18, K19, K20, K21, K22, K23, K24, K25, K26, K27, K28, K29, K30, K31,
+        K32, K33, K34, K35, K36, K37, K38, K39, K40, K41, K42, K43, K44, K45, K46, K47,
+        K48, K49, K50, K51, K52, K53, K54, K55, K56, K57, K58, K59, K60, K61, K62, K63
+    };
+
+    // Compression
+    #pragma unroll
+    for(int i=0; i<64; i++) {
+        t1 = h + SIGMA1(e) + CH(e, f, g) + K[i] + W[i];
+        t2 = SIGMA0(a) + MAJ(a, b, c);
+        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+// Single block hasher for short inputs (< 56 bytes)
+// Most passwords fall here
+void sha256_hash_single(const uchar* input, uint len, uchar* output) {
+    uint state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    
+    uchar buffer[64];
+    
+    #pragma unroll
+    for(int i=0; i<64; i++) buffer[i] = 0;
+    
+    for(int i=0; i<len; i++) buffer[i] = input[i];
+    
+    buffer[len] = 0x80;
+    uint bit_len = len * 8;
+    
+    buffer[63] = bit_len & 0xFF;
+    buffer[62] = (bit_len >> 8) & 0xFF;
+    buffer[61] = (bit_len >> 16) & 0xFF;
+    buffer[60] = (bit_len >> 24) & 0xFF;
+    
+    sha256_transform_block(state, buffer);
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        output[i * 4] = (state[i] >> 24) & 0xFF;
+        output[i * 4 + 1] = (state[i] >> 16) & 0xFF;
+        output[i * 4 + 2] = (state[i] >> 8) & 0xFF;
+        output[i * 4 + 3] = state[i] & 0xFF;
+    }
+}
+
+// ==========================================
+// KERNEL: Dictionary Attack
+// ==========================================
+__kernel void dictionary_attack(
+    __global const uchar* wordlist_data,
+    __global const uint* offsets,
+    uint count,
+    __global const uchar* target_hash, 
+    __global const uchar* salt,       
+    uint salt_len,
+    __global uint* result_found,
+    __global uint* result_index
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+    if (*result_found > 0) return;
+
+    uint start = offsets[gid];
+    uint end = offsets[gid+1];
+    uint word_len = end - start;
+    if (word_len > 50) return; // Ignore massive words to prevent stack blowup
+
+    uchar candidate[64]; // Max buffer for single block hash
+    
+    // Copy word
+    for(int i=0; i<word_len; i++) candidate[i] = wordlist_data[start + i];
+    
+    // 1. Raw Hash
+    uchar digest[32];
+    sha256_hash_single(candidate, word_len, digest);
+    
+    bool match = true;
+    for(int i=0; i<32; i++) if (digest[i] != target_hash[i]) match = false;
+    
+    if (match) {
+        *result_found = 1;
+        *result_index = gid;
+        return;
+    }
+    
+    // 2. Pass + Salt (Only if it fits in 1 block for speed)
+    if (salt_len > 0 && (word_len + salt_len < 56)) {
+        for(int i=0; i<salt_len; i++) candidate[word_len + i] = salt[i];
+        sha256_hash_single(candidate, word_len + salt_len, digest);
+        
+        match = true;
+        for(int i=0; i<32; i++) if (digest[i] != target_hash[i]) match = false;
+        
+        if (match) {
+            *result_found = 1;
+            *result_index = gid;
+            return;
+        }
+        
+        // 3. Salt + Pass
+        for(int i=0; i<salt_len; i++) candidate[i] = salt[i];
+        for(int i=0; i<word_len; i++) candidate[salt_len + i] = wordlist_data[start + i];
+        sha256_hash_single(candidate, salt_len + word_len, digest);
+        
+        match = true;
+        for(int i=0; i<32; i++) if (digest[i] != target_hash[i]) match = false;
+        
+        if (match) {
+            *result_found = 1;
+            *result_index = gid;
+            return;
+        }
+    }
+}
+
+// ==========================================
+// KERNEL: Brute Force Attack
+// ==========================================
+__kernel void brute_force_attack(
+    __constant uchar* charset,
+    ulong charset_len,
+    ulong start_offset, 
+    uint pass_len,
+    __global const uchar* target_hash,
+    __global const uchar* salt,
+    uint salt_len,
+    __global uint* result_found,
+    __global uchar* result_word
+) {
+    ulong gid = get_global_id(0);
+    // Note: We don't check bounds here, host must ensure sizing is correct or we just calc garbage
+    if (*result_found > 0) return;
+
+    ulong absolute_id = start_offset + gid;
+    uchar candidate[64]; // Max buffer
+    
+    // Base-N conversion
+    // This turns the global ID (0, 1, 2...) into ("aaaa", "aaab", "aaac"...)
+    ulong temp = absolute_id;
+    for(int i = pass_len - 1; i >= 0; i--) {
+        candidate[i] = charset[temp % charset_len];
+        temp /= charset_len;
+    }
+    
+    // Hashing
+    uchar digest[32];
+    sha256_hash_single(candidate, pass_len, digest);
+    
+    bool match = true;
+    #pragma unroll
+    for(int i=0; i<32; i++) if (digest[i] != target_hash[i]) match = false;
+    
+    if (match) {
+        // Atomic compare exchange is cleaner but simple write works since we stop
+        *result_found = 1;
+        // Copy pass to output
+        for(int i=0; i<pass_len; i++) result_word[i] = candidate[i];
+        result_word[pass_len] = 0; // Null term
+        return;
+    }
+    
+    // Pass + Salt
+    if (salt_len > 0 && (pass_len + salt_len < 56)) {
+        for(int i=0; i<salt_len; i++) candidate[pass_len + i] = salt[i];
+        sha256_hash_single(candidate, pass_len + salt_len, digest);
+        
+        match = true;
+        #pragma unroll
+        for(int i=0; i<32; i++) if (digest[i] != target_hash[i]) match = false;
+        
+        if (match) {
+            *result_found = 1;
+            for(int i=0; i<pass_len; i++) result_word[i] = candidate[i]; // Return pure password
+            result_word[pass_len] = 0;
+            return;
+        }
+        
+        // Salt + Pass
+        for(int i=0; i<salt_len; i++) candidate[i] = salt[i];
+        // Re-generate pass part
+        temp = absolute_id;
+        for(int i = pass_len - 1; i >= 0; i--) {
+            candidate[salt_len + i] = charset[temp % charset_len];
+            temp /= charset_len;
+        }
+        
+        sha256_hash_single(candidate, salt_len + pass_len, digest);
+        match = true;
+        #pragma unroll
+        for(int i=0; i<32; i++) if (digest[i] != target_hash[i]) match = false;
+        
+        if (match) {
+            *result_found = 1;
+            // Re-re-gen pure pass for output (slow but only happens once)
+            temp = absolute_id;
+            for(int i = pass_len - 1; i >= 0; i--) {
+                result_word[i] = charset[temp % charset_len];
+                temp /= charset_len;
+            }
+            result_word[pass_len] = 0;
+            return;
+        }
+    }
+}
+"#;

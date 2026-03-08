@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+cache_builder.log
+english-95-extended.txt
+*.log

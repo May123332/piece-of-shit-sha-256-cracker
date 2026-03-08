@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=ShadowBreaker Pro
+Comment=Advanced Local Hash Cracker
+Exec=/mnt/Data/gemini/sha_decryptor/.venv/bin/python /mnt/Data/gemini/sha_decryptor/shadow_breaker_pro.py
+Icon=/home/may/.local/share/icons/shadowbreaker.svg
+Terminal=false
+Type=Application
+Categories=Utility;Security;
+StartupWMClass=ShadowBreaker Pro

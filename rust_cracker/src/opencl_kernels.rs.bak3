@@ -1,0 +1,241 @@
+pub const SHA256_KERNEL: &str = r#"
+// ==========================================
+// SHA-256 VECTORIZED (UINT4)
+// ==========================================
+
+// Vector Rotate
+#define ROR(x, n) rotate(x, (uint4)(32 - n))
+
+// Vector Logic
+#define CH(x, y, z) (z ^ (x & (y ^ z)))
+#define MAJ(x, y, z) ((x & y) | (z & (x | y)))
+
+#define SIGMA0(x) (ROR(x, 2) ^ ROR(x, 13) ^ ROR(x, 22))
+#define SIGMA1(x) (ROR(x, 6) ^ ROR(x, 11) ^ ROR(x, 25))
+#define GAMMA0(x) (ROR(x, 7) ^ ROR(x, 18) ^ (x >> 3))
+#define GAMMA1(x) (ROR(x, 17) ^ ROR(x, 19) ^ (x >> 10))
+
+__constant uint K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+// Transform 4 blocks at once
+void sha256_transform_vector(uint4* state, const uint4* W_schedule) {
+    uint4 a = state[0];
+    uint4 b = state[1];
+    uint4 c = state[2];
+    uint4 d = state[3];
+    uint4 e = state[4];
+    uint4 f = state[5];
+    uint4 g = state[6];
+    uint4 h = state[7];
+    
+    uint4 t1, t2;
+    uint4 W_curr;
+
+    #pragma unroll
+    for(int i=0; i<64; i++) {
+        W_curr = W_schedule[i];
+        t1 = h + SIGMA1(e) + CH(e, f, g) + K[i] + W_curr;
+        t2 = SIGMA0(a) + MAJ(a, b, c);
+        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+// Single block hasher for short inputs (< 56 bytes)
+// Input: uchar buffer per lane
+void sha256_hash_vector(const uchar* cand0, const uchar* cand1, const uchar* cand2, const uchar* cand3, uint len, uint4* digest_out) {
+    uint4 state[8];
+    state[0] = (uint4)(0x6a09e667); state[1] = (uint4)(0xbb67ae85);
+    state[2] = (uint4)(0x3c6ef372); state[3] = (uint4)(0xa54ff53a);
+    state[4] = (uint4)(0x510e527f); state[5] = (uint4)(0x9b05688c);
+    state[6] = (uint4)(0x1f83d9ab); state[7] = (uint4)(0x5be0cd19);
+    
+    // Prepare W schedule (64 uint4s)
+    uint4 W[64];
+    
+    // Load data into W[0..15]
+    // We construct 32-bit words from 4 bytes of input for each lane
+    // Since len is constant for all lanes, we loop 0..15
+    
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        uint4 w;
+        int idx = i * 4;
+        
+        // Lane 0
+        uint w0 = 0;
+        if(idx < len) w0 |= ((uint)cand0[idx]) << 24;
+        else if(idx == len) w0 |= 0x80000000;
+        
+        if(idx+1 < len) w0 |= ((uint)cand0[idx+1]) << 16;
+        else if(idx+1 == len) w0 |= 0x00800000;
+        
+        if(idx+2 < len) w0 |= ((uint)cand0[idx+2]) << 8;
+        else if(idx+2 == len) w0 |= 0x00008000;
+        
+        if(idx+3 < len) w0 |= ((uint)cand0[idx+3]);
+        else if(idx+3 == len) w0 |= 0x00000080;
+        
+        // Repeat for Lane 1, 2, 3...
+        // This manual packing is ugly but necessary for uchar -> uint4 conversion
+        uint w1 = 0;
+        if(idx < len) w1 |= ((uint)cand1[idx]) << 24; else if(idx == len) w1 |= 0x80000000;
+        if(idx+1 < len) w1 |= ((uint)cand1[idx+1]) << 16; else if(idx+1 == len) w1 |= 0x00800000;
+        if(idx+2 < len) w1 |= ((uint)cand1[idx+2]) << 8; else if(idx+2 == len) w1 |= 0x00008000;
+        if(idx+3 < len) w1 |= ((uint)cand1[idx+3]); else if(idx+3 == len) w1 |= 0x00000080;
+
+        uint w2 = 0;
+        if(idx < len) w2 |= ((uint)cand2[idx]) << 24; else if(idx == len) w2 |= 0x80000000;
+        if(idx+1 < len) w2 |= ((uint)cand2[idx+1]) << 16; else if(idx+1 == len) w2 |= 0x00800000;
+        if(idx+2 < len) w2 |= ((uint)cand2[idx+2]) << 8; else if(idx+2 == len) w2 |= 0x00008000;
+        if(idx+3 < len) w2 |= ((uint)cand2[idx+3]); else if(idx+3 == len) w2 |= 0x00000080;
+
+        uint w3 = 0;
+        if(idx < len) w3 |= ((uint)cand3[idx]) << 24; else if(idx == len) w3 |= 0x80000000;
+        if(idx+1 < len) w3 |= ((uint)cand3[idx+1]) << 16; else if(idx+1 == len) w3 |= 0x00800000;
+        if(idx+2 < len) w3 |= ((uint)cand2[idx+2]) << 8; else if(idx+2 == len) w3 |= 0x00008000;
+        if(idx+3 < len) w3 |= ((uint)cand3[idx+3]); else if(idx+3 == len) w3 |= 0x00000080;
+
+        W[i] = (uint4)(w0, w1, w2, w3);
+    }
+    
+    // Append Length (assuming single block < 56 bytes)
+    uint bit_len = len * 8;
+    W[15] = (uint4)(bit_len); // Only the last word holds length in SHA256 single block? 
+                              // Wait, SHA256 uses 64-bit length at end of 512-bit block.
+                              // Block is 16 words (0..15). 
+                              // W[15] is the lower 32-bits of length. W[14] is upper.
+    W[14] = (uint4)(0);       // Upper 32-bits zero for short pass
+    
+    // Expansion
+    #pragma unroll
+    for (int i = 16; i < 64; i++) {
+        W[i] = GAMMA1(W[i - 2]) + W[i - 7] + GAMMA0(W[i - 15]) + W[i - 16];
+    }
+    
+    // Compression
+    sha256_transform_vector(state, W);
+    
+    // Output
+    for(int i=0; i<8; i++) digest_out[i] = state[i];
+}
+
+__kernel void brute_force_attack(
+    __constant uchar* charset,
+    ulong charset_len,
+    ulong start_offset, 
+    uint pass_len,
+    __constant uchar* target_hash,
+    __constant uchar* salt,
+    uint salt_len,
+    __global uint* result_found,
+    __global uchar* result_word
+) {
+    ulong gid = get_global_id(0);
+    // Work items process 4 candidates each.
+    // Real Global ID = start_offset + (gid * 4)
+    if (*result_found > 0) return;
+
+    ulong base_id = start_offset + (gid * 4);
+    
+    // Generate 4 Candidates
+    uchar c0[64], c1[64], c2[64], c3[64];
+    
+    // Gen C0
+    ulong t = base_id;
+    for(int i=pass_len-1; i>=0; i--) { c0[i] = charset[t % charset_len]; t /= charset_len; }
+    
+    // Gen C1
+    t = base_id + 1;
+    for(int i=pass_len-1; i>=0; i--) { c1[i] = charset[t % charset_len]; t /= charset_len; }
+    
+    // Gen C2
+    t = base_id + 2;
+    for(int i=pass_len-1; i>=0; i--) { c2[i] = charset[t % charset_len]; t /= charset_len; }
+    
+    // Gen C3
+    t = base_id + 3;
+    for(int i=pass_len-1; i>=0; i--) { c3[i] = charset[t % charset_len]; t /= charset_len; }
+    
+    // Hash All 4
+    uint4 digest[8]; // Vectorized Digest
+    sha256_hash_vector(c0, c1, c2, c3, pass_len, digest);
+    
+    // Check Matches
+    // We check each lane individually against target
+    // Target is byte array, convert to 8 words
+    uint target_w[8];
+    #pragma unroll
+    for(int i=0; i<8; i++) {
+        target_w[i] = (target_hash[i*4]<<24) | (target_hash[i*4+1]<<16) | (target_hash[i*4+2]<<8) | target_hash[i*4+3];
+    }
+    
+    // Lane 0
+    bool m0 = true; 
+    for(int i=0; i<8; i++) if(digest[i].x != target_w[i]) m0 = false;
+    if(m0) {
+        *result_found = 1;
+        for(int i=0; i<pass_len; i++) result_word[i] = c0[i];
+        result_word[pass_len] = 0;
+        return;
+    }
+    
+    // Lane 1
+    bool m1 = true; 
+    for(int i=0; i<8; i++) if(digest[i].y != target_w[i]) m1 = false;
+    if(m1) {
+        *result_found = 1;
+        for(int i=0; i<pass_len; i++) result_word[i] = c1[i];
+        result_word[pass_len] = 0;
+        return;
+    }
+    
+    // Lane 2
+    bool m2 = true; 
+    for(int i=0; i<8; i++) if(digest[i].z != target_w[i]) m2 = false;
+    if(m2) {
+        *result_found = 1;
+        for(int i=0; i<pass_len; i++) result_word[i] = c2[i];
+        result_word[pass_len] = 0;
+        return;
+    }
+    
+    // Lane 3
+    bool m3 = true; 
+    for(int i=0; i<8; i++) if(digest[i].w != target_w[i]) m3 = false;
+    if(m3) {
+        *result_found = 1;
+        for(int i=0; i<pass_len; i++) result_word[i] = c3[i];
+        result_word[pass_len] = 0;
+        return;
+    }
+    
+    // Salted logic would follow similar pattern (omitted for brevity in this step, raw brute force is priority)
+}
+
+// Dictionary placeholder
+__kernel void dictionary_attack(
+    __global const uchar* wordlist_data,
+    __global const uint* offsets,
+    uint count,
+    __constant uchar* target_hash, 
+    __constant uchar* salt,       
+    uint salt_len,
+    __global uint* result_found,
+    __global uint* result_index
+) {
+    uint gid = get_global_id(0);
+    if (gid >= count) return;
+}
+"#;
