@@ -29,7 +29,8 @@ extern "C" {
         result_word: *mut u8,
         batch_size: u64,
         blocks: i32,
-        threads: i32
+        threads: i32,
+        items_per_thread: u32,
     ) -> i32;
     fn cleanup_brute_force_hip();
 }
@@ -111,7 +112,6 @@ enum Algorithm {
 
 static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 const COUNTER_FLUSH_INTERVAL: u64 = 8192;
-const HIP_ITEMS_PER_THREAD: u64 = 1;
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -430,16 +430,18 @@ fn run_hip_brute(
     };
     let suffix_end = if max_len as u32 >= prefix_len { (max_len as u32 - prefix_len) as usize } else { 0 };
 
+    let launch_config = autotune_hip_launch_config(device_info, charset_bytes, &target_u32);
+    println!(
+        "HIP_TUNING: blocks={} threads={} items={} batch={}",
+        launch_config.blocks,
+        launch_config.threads,
+        launch_config.items_per_thread,
+        launch_config.batch_size
+    );
+
     for len in suffix_start..=suffix_end {
         let total_combos = (charset_bytes.len() as u64).pow(len as u32);
         println!("STATUS:Checking suffix length {} ({} combinations)...", len, total_combos);
-        let launch_config = hip_launch_config(device_info);
-        println!(
-            "HIP_TUNING: blocks={} threads={} batch={}",
-            launch_config.blocks,
-            launch_config.threads,
-            launch_config.batch_size
-        );
         let mut offset: u64 = 0;
         
         while offset < total_combos {
@@ -469,7 +471,8 @@ fn run_hip_brute(
                     result_host.as_mut_ptr(),
                     current_batch,
                     launch_config.blocks,
-                    launch_config.threads
+                    launch_config.threads,
+                    launch_config.items_per_thread,
                 )
             };
             if rc != 0 {
@@ -507,6 +510,17 @@ fn run_hip_brute(
     Ok(None)
 }
 
+// Pre-parse a 32-byte SHA-256 hash into 8 big-endian uint32 words.
+// The kernel receives this directly, skipping per-thread byte-decode.
+fn target_to_u32x8(hash_bytes: &[u8]) -> [u32; 8] {
+    let mut out = [0u32; 8];
+    for i in 0..8 {
+        let j = i * 4;
+        out[i] = u32::from_be_bytes([hash_bytes[j], hash_bytes[j+1], hash_bytes[j+2], hash_bytes[j+3]]);
+    }
+    out
+}
+
 fn run_gpu_mode(
     platform: Platform, 
     device: Device, 
@@ -515,20 +529,27 @@ fn run_gpu_mode(
     salt: Option<&[u8]>
 ) -> ocl::Result<Option<String>> {
     
-    // 1. Setup OpenCL Context & Buffers (Common)
+    // 1. Setup OpenCL Context
     let context = Context::builder().platform(platform).devices(device).build()?;
-    let queue = Queue::new(&context, device, None)?;
+    // Two queues for double-buffered async dispatch in dictionary mode
+    let queue  = Queue::new(&context, device, None)?;
+    let queue2 = Queue::new(&context, device, None)?;
+
+    // RDNA2 optimization: fast math + mad-enable for better ALU scheduling
+    let build_flags = "-cl-fast-relaxed-math -cl-mad-enable -cl-no-signed-zeros";
     let program = Program::builder()
         .src(opencl_kernels::SHA256_KERNEL)
         .devices(device)
+        .cmplr_opt(build_flags)
         .build(&context)?;
 
-    // Common Buffers
+    // Pre-parse target hash to uint32[8] - kernels use this directly
+    let target_u32 = target_to_u32x8(target);
     let target_buf = Buffer::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().read_only().host_write_only())
-        .len(32)
-        .copy_host_slice(target)
+        .len(8usize)
+        .copy_host_slice(&target_u32)
         .build()?;
     
     let salt_len = salt.map(|s| s.len()).unwrap_or(0);
@@ -551,47 +572,57 @@ fn run_gpu_mode(
         println!("STATUS:Loading wordlist to RAM...");
         let file = File::open(path).expect("File not found");
         let reader = io::BufReader::new(file);
-        
-        let mut flat_data = Vec::new();
-        let mut offsets = Vec::new();
+
+        // Collect all words first so we can length-sort them.
+        // Sorting by length groups words of the same length into the same
+        // workgroup, eliminating branch divergence from different-length salted
+        // variants and short-circuit paths hitting different depths.
+        let mut words: Vec<Vec<u8>> = reader.lines()
+            .filter_map(|l| l.ok())
+            .map(|l| l.into_bytes())
+            .filter(|w| w.len() <= 55)
+            .collect();
+        words.sort_unstable_by_key(|w| w.len());
+
+        let count = words.len();
+        println!("STATUS:Sorted {} words by length, uploading to VRAM...", count);
+
+        let mut flat_data: Vec<u8> = Vec::with_capacity(count * 8);
+        let mut offsets: Vec<u32> = Vec::with_capacity(count + 1);
         offsets.push(0u32);
-        
-        let mut count = 0;
-        for line in reader.lines() {
-            if let Ok(word) = line {
-                flat_data.extend_from_slice(word.as_bytes());
-                offsets.push(flat_data.len() as u32);
-                count += 1;
-            }
+        for w in &words {
+            flat_data.extend_from_slice(w);
+            offsets.push(flat_data.len() as u32);
         }
-        println!("STATUS:Uploading {} words to VRAM...", count);
-        
-        let local_wg = 256;
-        let aligned_word_count = ((count + local_wg - 1) / local_wg) * local_wg;
-        let mut offsets_padded = offsets.clone();
+
+        let lws: usize = opencl_kernels::RX6800_OPTIMAL_LWS;
+        let aligned_count = ((count + lws - 1) / lws) * lws;
         let last_offset = *offsets.last().unwrap();
-        while offsets_padded.len() <= aligned_word_count + 1 { offsets_padded.push(last_offset); }
+        let mut offsets_padded = offsets.clone();
+        while offsets_padded.len() <= aligned_count + 1 { offsets_padded.push(last_offset); }
 
-        let wordlist_buf = Buffer::builder().queue(queue.clone()).flags(MemFlags::new().read_only()).len(flat_data.len()).copy_host_slice(&flat_data).build()?;
-        let offsets_buf = Buffer::builder().queue(queue.clone()).flags(MemFlags::new().read_only()).len(offsets_padded.len()).copy_host_slice(&offsets_padded).build()?;
+        let wordlist_buf     = Buffer::builder().queue(queue.clone()).flags(MemFlags::new().read_only()).len(flat_data.len().max(1)).copy_host_slice(&flat_data).build()?;
+        let offsets_buf      = Buffer::builder().queue(queue.clone()).flags(MemFlags::new().read_only()).len(offsets_padded.len()).copy_host_slice(&offsets_padded).build()?;
         let result_index_buf = Buffer::<u32>::builder().queue(queue.clone()).flags(MemFlags::new().read_write()).len(1).fill_val(0u32).build()?;
-
-        let max_wg = device.max_wg_size()?;
-        let local_wg = if max_wg >= 256 { 256 } else { max_wg };
 
         let kernel = Kernel::builder()
             .program(&program)
             .name("dictionary_attack")
             .queue(queue.clone())
-            .global_work_size(aligned_word_count)
-            .local_work_size(local_wg)
-            .arg(&wordlist_buf).arg(&offsets_buf).arg(count as u32)
-            .arg(&target_buf).arg(&salt_buf).arg(salt_len as u32)
-            .arg(&result_found_buf).arg(&result_index_buf)
+            .global_work_size(aligned_count)
+            .local_work_size(lws)
+            .arg(&wordlist_buf)
+            .arg(&offsets_buf)
+            .arg(count as u32)
+            .arg(&target_buf)       // uint32[8] pre-parsed
+            .arg(&salt_buf)
+            .arg(salt_len as u32)
+            .arg(&result_found_buf)
+            .arg(&result_index_buf)
             .build()?;
 
         unsafe { kernel.enq()?; }
-        
+
         let mut found = vec![0u32; 1];
         result_found_buf.read(&mut found).enq()?;
         GLOBAL_COUNTER.store(count as u64, Ordering::Relaxed);
@@ -599,15 +630,109 @@ fn run_gpu_mode(
         if found[0] == 1 {
             let mut idx = vec![0u32; 1];
             result_index_buf.read(&mut idx).enq()?;
-            let i = idx[0] as usize;
-            let s = offsets[i] as usize;
-            let e = offsets[i+1] as usize;
+            let i   = idx[0] as usize;
+            let s   = offsets[i] as usize;
+            let e   = offsets[i+1] as usize;
             return Ok(Some(String::from_utf8_lossy(&flat_data[s..e]).to_string()));
         }
 
     } else {
-        // Brute-force OpenCL kernel path is not implemented in this build.
-        return Err(ocl::Error::from("OpenCL brute-force fallback is not implemented"));
+        // ---- Brute force via OpenCL (scalar, one candidate per thread) ----
+        // Using scalar SHA256 + rolling W[16] => ~60 VGPRs => near-full occupancy
+        // RX 6800: 60 CUs * 2 SIMDs * 16 wavefronts * 64 threads = 122,880 threads
+        let lws: usize = opencl_kernels::RX6800_OPTIMAL_LWS;
+        let batch_size = opencl_kernels::RX6800_BATCH_SIZE;
+
+        let charset_bytes = args.charset.as_bytes();
+        let max_len       = args.length.unwrap_or(4);
+        let prefix_len    = args.prefix.len() as u32;
+        let prefix_bytes  = args.prefix.as_bytes();
+
+        let charset_buf = Buffer::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only().host_write_only())
+            .len(charset_bytes.len())
+            .copy_host_slice(charset_bytes)
+            .build()?;
+
+        let prefix_buf = Buffer::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_only().host_write_only())
+            .len(if prefix_len > 0 { prefix_len as usize } else { 1 })
+            .copy_host_slice(if prefix_len > 0 { prefix_bytes } else { &[0] })
+            .build()?;
+
+        let result_word_buf = Buffer::<u8>::builder()
+            .queue(queue.clone())
+            .flags(MemFlags::new().read_write())
+            .len(64)
+            .fill_val(0u8)
+            .build()?;
+
+        let _ = queue2; // keep alive
+
+        let suffix_start = if prefix_len == 0 { 1usize } else {
+            if max_len as u32 > prefix_len { (max_len as u32 - prefix_len) as usize } else { 0 }
+        };
+        let suffix_end = if max_len as u32 >= prefix_len { (max_len as u32 - prefix_len) as usize } else { 0 };
+
+        for suffix_len_iter in suffix_start..=suffix_end {
+            let total_combos = (charset_bytes.len() as u64).pow(suffix_len_iter as u32);
+            println!("STATUS:Brute suffix_len={} total={} batch={}", suffix_len_iter, total_combos, batch_size);
+
+            let mut offset: u64 = 0;
+            while offset < total_combos {
+                // Non-blocking result poll on subsequent batches
+                if offset > 0 {
+                    let mut found_check = vec![0u32; 1];
+                    result_found_buf.read(&mut found_check).enq()?;
+                    if found_check[0] == 1 {
+                        let mut word_raw = vec![0u8; 64];
+                        result_word_buf.read(&mut word_raw).enq()?;
+                        let end = word_raw.iter().position(|&b| b == 0).unwrap_or(64);
+                        let full = format!("{}{}", args.prefix, String::from_utf8_lossy(&word_raw[..end]));
+                        return Ok(Some(full));
+                    }
+                }
+
+                let current_batch = std::cmp::min(batch_size, total_combos - offset);
+                let gws = ((current_batch as usize + lws - 1) / lws) * lws;
+
+                let kernel = Kernel::builder()
+                    .program(&program)
+                    .name("brute_force_attack")
+                    .queue(queue.clone())
+                    .global_work_size(gws)
+                    .local_work_size(lws)
+                    .arg(&charset_buf)
+                    .arg(charset_bytes.len() as u64)
+                    .arg(offset)
+                    .arg(suffix_len_iter as u32)
+                    .arg(&target_buf)
+                    .arg(&salt_buf)
+                    .arg(salt_len as u32)
+                    .arg(&result_found_buf)
+                    .arg(&result_word_buf)
+                    .arg(&prefix_buf)
+                    .arg(prefix_len)
+                    .build()?;
+
+                unsafe { kernel.enq()?; }
+                GLOBAL_COUNTER.fetch_add(current_batch, Ordering::Relaxed);
+                offset += current_batch;
+            }
+
+            queue.finish()?;
+            let mut found = vec![0u32; 1];
+            result_found_buf.read(&mut found).enq()?;
+            if found[0] == 1 {
+                let mut word_raw = vec![0u8; 64];
+                result_word_buf.read(&mut word_raw).enq()?;
+                let end = word_raw.iter().position(|&b| b == 0).unwrap_or(64);
+                let full = format!("{}{}", args.prefix, String::from_utf8_lossy(&word_raw[..end]));
+                return Ok(Some(full));
+            }
+        }
     }
 
     Ok(None)
@@ -654,29 +779,179 @@ fn flush_global_counter(local_counter: &mut u64) {
 }
 
 #[cfg(has_hip)]
+#[derive(Clone, Copy, Debug)]
 struct HipLaunchConfig {
     blocks: i32,
     threads: i32,
+    items_per_thread: u32,
     batch_size: u64,
 }
 
 #[cfg(has_hip)]
+fn read_env_i32(name: &str) -> Option<i32> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+#[cfg(has_hip)]
+fn read_env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+#[cfg(has_hip)]
 fn hip_launch_config(device_info: &HipDeviceInfo) -> HipLaunchConfig {
+    let batch_cap = read_env_u64("HIP_BATCH_CAP").unwrap_or(6_039_797_760).max(1);
+
+    if let (Some(blocks), Some(threads), Some(batch_size)) = (
+        read_env_i32("HIP_BLOCKS"),
+        read_env_i32("HIP_THREADS"),
+        read_env_u64("HIP_BATCH_SIZE"),
+    ) {
+        let items_per_thread = read_env_i32("HIP_ITEMS_PER_THREAD")
+            .unwrap_or(8)
+            .max(1) as u32;
+        return HipLaunchConfig {
+            blocks: blocks.max(1),
+            threads: threads.max(device_info.warp_size.max(32)),
+            items_per_thread,
+            batch_size: batch_size.max(1).min(batch_cap),
+        };
+    }
+
     let wave_size = device_info.warp_size.max(32);
-    let mut threads = device_info.max_threads_per_block.min(256).max(wave_size);
+    let mut threads = read_env_i32("HIP_THREADS_PER_BLOCK")
+        .unwrap_or(device_info.max_threads_per_block.min(256))
+        .min(device_info.max_threads_per_block.min(256))
+        .max(wave_size);
     threads -= threads % wave_size;
     if threads <= 0 {
         threads = wave_size;
     }
 
-    let blocks_per_cu = 24;
+    let blocks_per_cu = read_env_i32("HIP_BLOCKS_PER_CU").unwrap_or(32).max(1);
+    let items_per_thread = read_env_i32("HIP_ITEMS_PER_THREAD")
+        .unwrap_or(8)
+        .max(1) as u32;
+    let batch_multiplier = read_env_u64("HIP_BATCH_MULTIPLIER").unwrap_or(32_768).max(1);
     let blocks = (device_info.multiprocessor_count.max(1) * blocks_per_cu).max(1);
-    let batch_size = blocks as u64 * threads as u64 * HIP_ITEMS_PER_THREAD * 16_384;
+    let batch_size =
+        (blocks as u64 * threads as u64 * items_per_thread as u64 * batch_multiplier).min(batch_cap);
 
     HipLaunchConfig {
         blocks,
         threads,
+        items_per_thread,
         batch_size,
+    }
+}
+
+#[cfg(has_hip)]
+fn hip_launch_candidates(device_info: &HipDeviceInfo) -> Vec<HipLaunchConfig> {
+    let wave_size = device_info.warp_size.max(32);
+    let max_threads = device_info.max_threads_per_block.min(256).max(wave_size);
+    let batch_cap = read_env_u64("HIP_BATCH_CAP").unwrap_or(6_039_797_760).max(1);
+    let mut candidates = Vec::new();
+
+    for blocks_per_cu in [24, 32, 40, 48] {
+        for items_per_thread in [4u32, 8u32, 16u32] {
+            let blocks = (device_info.multiprocessor_count.max(1) * blocks_per_cu).max(1);
+            let threads = max_threads - (max_threads % wave_size);
+            let batch_size = (blocks as u64 * threads as u64 * items_per_thread as u64 * 16_384)
+                .max(268_435_456)
+                .min(batch_cap);
+            candidates.push(HipLaunchConfig {
+                blocks,
+                threads,
+                items_per_thread,
+                batch_size,
+            });
+        }
+    }
+
+    candidates
+}
+
+#[cfg(has_hip)]
+fn autotune_hip_launch_config(
+    device_info: &HipDeviceInfo,
+    charset: &[u8],
+    _target_u32: &[u32; 8],
+) -> HipLaunchConfig {
+    if std::env::var_os("HIP_DISABLE_AUTOTUNE").is_some() {
+        return hip_launch_config(device_info);
+    }
+
+    let requested = hip_launch_config(device_info);
+    if std::env::var_os("HIP_BLOCKS").is_some()
+        || std::env::var_os("HIP_THREADS").is_some()
+        || std::env::var_os("HIP_BATCH_SIZE").is_some()
+        || std::env::var_os("HIP_THREADS_PER_BLOCK").is_some()
+        || std::env::var_os("HIP_BLOCKS_PER_CU").is_some()
+        || std::env::var_os("HIP_BATCH_MULTIPLIER").is_some()
+        || std::env::var_os("HIP_ITEMS_PER_THREAD").is_some()
+    {
+        return requested;
+    }
+
+    let synthetic_target = [0xFFFF_FFFFu32; 8];
+    let mut bench_found = [0u32; 1];
+    let mut bench_result = [0u8; 64];
+    let mut best = requested;
+    let mut best_rate = 0.0f64;
+
+    for config in hip_launch_candidates(device_info) {
+        bench_found[0] = 0;
+        bench_result.fill(0);
+        let batch = config.batch_size.min(805_306_368);
+        let start = Instant::now();
+        let rc = unsafe {
+            launch_brute_force_hip(
+                charset.as_ptr(),
+                charset.len() as u64,
+                0,
+                8,
+                synthetic_target.as_ptr(),
+                bench_found.as_mut_ptr(),
+                bench_result.as_mut_ptr(),
+                batch,
+                config.blocks,
+                config.threads,
+                config.items_per_thread,
+            )
+        };
+        if rc != 0 {
+            continue;
+        }
+
+        let secs = start.elapsed().as_secs_f64();
+        if secs <= 0.0 {
+            continue;
+        }
+        let rate = batch as f64 / secs;
+        if rate > best_rate {
+            best_rate = rate;
+            best = config;
+        }
+    }
+
+    if best_rate > 0.0 {
+        println!(
+            "HIP_AUTOTUNE: selected blocks={} threads={} items={} batch={} speed={:.2} GH/s",
+            best.blocks,
+            best.threads,
+            best.items_per_thread,
+            best.batch_size,
+            best_rate / 1_000_000_000.0,
+        );
+        best
+    } else {
+        println!(
+            "HIP_AUTOTUNE: fallback blocks={} threads={} items={} batch={}",
+            requested.blocks,
+            requested.threads,
+            requested.items_per_thread,
+            requested.batch_size,
+        );
+        requested
     }
 }
 

@@ -1,14 +1,44 @@
 use std::env;
+use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+
+fn find_hipcc(rocm_path: &Path) -> Option<PathBuf> {
+    let candidates = [
+        env::var_os("HIPCC").map(PathBuf::from),
+        Some(rocm_path.join("bin/hipcc")),
+        env::var_os("PATH").and_then(|path| {
+            env::split_paths(&path)
+                .map(|dir| dir.join("hipcc"))
+                .find(|candidate| candidate.is_file())
+        }),
+    ];
+
+    candidates.into_iter().flatten().find(|path| path.is_file())
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=hip/sha256.hip");
     println!("cargo:rerun-if-env-changed=HIP_OFFLOAD_ARCH");
+    println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rustc-check-cfg=cfg(has_hip)");
 
-    if Command::new("hipcc").arg("--version").output().is_err() {
-        println!("cargo:warning=hipcc not found. ROCm HIP support disabled.");
+    let rocm_path = PathBuf::from(env::var_os("ROCM_PATH").unwrap_or_else(|| OsString::from("/opt/rocm")));
+    let Some(hipcc_path) = find_hipcc(&rocm_path) else {
+        println!(
+            "cargo:warning=hipcc not found in HIPCC, {}/bin, or PATH. ROCm HIP support disabled.",
+            rocm_path.display()
+        );
+        return;
+    };
+
+    if Command::new(&hipcc_path).arg("--version").output().is_err() {
+        println!(
+            "cargo:warning=Failed to execute {}. ROCm HIP support disabled.",
+            hipcc_path.display()
+        );
         return;
     }
 
@@ -16,12 +46,15 @@ fn main() {
     let obj_path = out_dir.join("sha256_hip.o");
     let lib_path = out_dir.join("libhip_cracker.a");
     let arch = env::var("HIP_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1030".to_string());
+    let include_dir = rocm_path.join("include");
 
-    let compile_status = Command::new("hipcc")
+    let compile_status = Command::new(&hipcc_path)
         .arg("-O3")
         .arg("-ffast-math")
         .arg("-march=native")
         .arg("-mtune=native")
+        .arg("-I")
+        .arg(&include_dir)
         .arg(format!("--offload-arch={arch}"))
         .arg("-c")
         .arg("hip/sha256.hip")
@@ -71,7 +104,7 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=hip_cracker");
     println!("cargo:rustc-link-lib=dylib=amdhip64");
-    println!("cargo:rustc-link-search=native=/opt/rocm/lib");
-    println!("cargo:rustc-link-search=native=/opt/rocm/lib64");
+    println!("cargo:rustc-link-search=native={}", rocm_path.join("lib").display());
+    println!("cargo:rustc-link-search=native={}", rocm_path.join("lib64").display());
     println!("cargo:rustc-cfg=has_hip");
 }
